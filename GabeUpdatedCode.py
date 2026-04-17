@@ -134,12 +134,16 @@ class Trader:
     OSMIUM_COOLOFF_DURATION = 20
     OSMIUM_COOLOFF_EDGE = 7.0
 
-    # Pepper mean-reversion params (data: lag-1 autocorr ≈ -0.5)
-    PEPPER_EWMA_ALPHA = 0.15
-    PEPPER_TAKE_EDGE = 2.0
+    # Pepper: combine drift capture (positive +0.1/tick drift) with MR takes
+    PEPPER_HISTORY_LEN = 40
+    PEPPER_MIN_HISTORY = 20
+    PEPPER_SLOPE_THRESHOLD = 0.04
+    PEPPER_TREND_TAKE_EDGE = 0.5
+    PEPPER_MR_TAKE_EDGE = 4.0
     PEPPER_MAKE_EDGE = 1.0
-    PEPPER_RISK_SCALE = 3.0
-    PEPPER_MIN_WARMUP = 20
+    PEPPER_RISK_SCALE = 1.5
+    PEPPER_MM_CLIP = 35
+    PEPPER_MM_CLIP_WITH_TREND = 50
 
     # Shared inventory management
     AGGRESSIVE_CLEAR_FRAC = 0.7
@@ -150,8 +154,7 @@ class Trader:
 
         td: Dict[str, Any] = {
             "OSMIUM_HISTORY": [],
-            "pepper_ewma": None,
-            "pepper_warmup": 0,
+            "pepper_mids": [],
             "osmium_cooloff": {"ticks_left": 0, "side": None},
             "last_osmium_fills": [],
         }
@@ -190,14 +193,6 @@ class Trader:
         td_out = json.dumps(td)
         logger.flush(state, result, conversions, td_out)
         return result, conversions, td_out
-
-    def _depth_size(self, book: Dict[int, int]) -> int:
-        total = 0
-        for i, (_, v) in enumerate(sorted(book.items(), key=lambda kv: kv[0])):
-            total += abs(v)
-            if i >= 2:
-                break
-        return total
 
     def _update_osmium_cooloff(self, state: TradingState, td: Dict[str, Any]) -> None:
         cooloff = td.get("osmium_cooloff") or {"ticks_left": 0, "side": None}
@@ -302,9 +297,10 @@ class Trader:
 
         return orders
 
-    # PEPPER: EWMA-anchored mean reversion. Tick returns have lag-1 autocorr
-    # ≈ -0.5 in the round-1 data, so deviations from a short-horizon EWMA
-    # revert in the next tick. EWMA tracks the ~+0.1/tick intraday drift.
+    # PEPPER: drift capture via OLS slope + MR takes on big dislocations + clipped MM.
+    # Data shows positive drift (+0.1/tick, ~+1000/day) and lag-1 return autocorr ≈ -0.5.
+    # The old trend-follow captured drift because slope was positive most of the time;
+    # combining that with wide-edge MR takes gives us both sides of the signal.
     def _trade_pepper(
         self,
         product: str,
@@ -317,51 +313,67 @@ class Trader:
     ) -> List[Order]:
         orders: List[Order] = []
 
-        ewma = td.get("pepper_ewma")
-        alpha = self.PEPPER_EWMA_ALPHA
-        ewma = vw_mid if ewma is None else alpha * vw_mid + (1 - alpha) * ewma
-        td["pepper_ewma"] = ewma
+        hist = td.get("pepper_mids", [])
+        hist.append(vw_mid)
+        if len(hist) > self.PEPPER_HISTORY_LEN:
+            hist.pop(0)
+        td["pepper_mids"] = hist
 
-        warmup = int(td.get("pepper_warmup", 0)) + 1
-        td["pepper_warmup"] = warmup
-        if warmup < self.PEPPER_MIN_WARMUP:
+        if len(hist) < self.PEPPER_MIN_HISTORY:
             return orders
 
-        fair = ewma
-        risk_offset = (pos / self.LIMIT) * self.PEPPER_RISK_SCALE
-        buy_thr = fair - self.PEPPER_TAKE_EDGE - risk_offset
-        sell_thr = fair + self.PEPPER_TAKE_EDGE - risk_offset
+        n = len(hist)
+        sum_x = n * (n - 1) / 2
+        sum_y = sum(hist)
+        sum_xx = sum(i * i for i in range(n))
+        sum_xy = sum(i * y for i, y in enumerate(hist))
+        denom = n * sum_xx - sum_x * sum_x
+        slope = (n * sum_xy - sum_x * sum_y) / denom if denom else 0.0
+        intercept = (sum_y - slope * sum_x) / n
+        predicted = intercept + slope * (n + 1)
 
-        # Depth-aware take cap: thick book → take aggressively, thin → half.
-        ask_depth = self._depth_size(depth.sell_orders)
-        bid_depth = self._depth_size(depth.buy_orders)
-        buy_cap = self.LIMIT if ask_depth >= 30 else (self.LIMIT // 2 if ask_depth < 10 else self.LIMIT)
-        sell_cap = self.LIMIT if bid_depth >= 30 else (self.LIMIT // 2 if bid_depth < 10 else self.LIMIT)
+        if slope > self.PEPPER_SLOPE_THRESHOLD:
+            direction = 1
+        elif slope < -self.PEPPER_SLOPE_THRESHOLD:
+            direction = -1
+        else:
+            direction = 0
 
-        bought = 0
+        # 1. Trend take: drift capture when slope is clearly positive/negative.
+        if direction == 1:
+            for price, vol in sorted(depth.sell_orders.items()):
+                if price <= predicted + self.PEPPER_TREND_TAKE_EDGE and pos < self.LIMIT:
+                    qty = min(abs(vol), self.LIMIT - pos)
+                    orders.append(Order(product, int(price), int(qty)))
+                    pos += qty
+        elif direction == -1:
+            for price, vol in sorted(depth.buy_orders.items(), reverse=True):
+                if price >= predicted - self.PEPPER_TREND_TAKE_EDGE and pos > -self.LIMIT:
+                    qty = min(abs(vol), pos + self.LIMIT)
+                    orders.append(Order(product, int(price), int(-qty)))
+                    pos -= qty
+
+        # 2. Mean-reversion take on extreme dislocations (rarely fires; pure alpha).
         for price, vol in sorted(depth.sell_orders.items()):
-            if price <= buy_thr and pos < self.LIMIT and bought < buy_cap:
-                qty = min(abs(vol), self.LIMIT - pos, buy_cap - bought)
+            if price <= predicted - self.PEPPER_MR_TAKE_EDGE and pos < self.LIMIT:
+                qty = min(abs(vol), self.LIMIT - pos)
                 orders.append(Order(product, int(price), int(qty)))
                 pos += qty
-                bought += qty
-
-        sold = 0
         for price, vol in sorted(depth.buy_orders.items(), reverse=True):
-            if price >= sell_thr and pos > -self.LIMIT and sold < sell_cap:
-                qty = min(abs(vol), pos + self.LIMIT, sell_cap - sold)
+            if price >= predicted + self.PEPPER_MR_TAKE_EDGE and pos > -self.LIMIT:
+                qty = min(abs(vol), pos + self.LIMIT)
                 orders.append(Order(product, int(price), int(-qty)))
                 pos -= qty
-                sold += qty
 
-        heavy_long = pos > self.AGGRESSIVE_CLEAR_FRAC * self.LIMIT
-        heavy_short = pos < -self.AGGRESSIVE_CLEAR_FRAC * self.LIMIT
+        # 3. Market-making: penny inside book, clipped, with light inventory skew.
+        risk_offset = (pos / self.LIMIT) * self.PEPPER_RISK_SCALE
+        clip = self.PEPPER_MM_CLIP_WITH_TREND if direction != 0 else self.PEPPER_MM_CLIP
 
-        if pos < self.LIMIT and not heavy_long:
-            buy_p = int(min(best_bid + 1, fair - self.PEPPER_MAKE_EDGE - risk_offset))
-            orders.append(Order(product, buy_p, self.LIMIT - pos))
-        if pos > -self.LIMIT and not heavy_short:
-            sell_p = int(max(best_ask - 1, fair + self.PEPPER_MAKE_EDGE - risk_offset))
-            orders.append(Order(product, sell_p, -self.LIMIT - pos))
+        if pos < self.LIMIT:
+            buy_p = int(min(best_bid + 1, predicted - self.PEPPER_MAKE_EDGE - risk_offset))
+            orders.append(Order(product, buy_p, min(self.LIMIT - pos, clip)))
+        if pos > -self.LIMIT:
+            sell_p = int(max(best_ask - 1, predicted + self.PEPPER_MAKE_EDGE - risk_offset))
+            orders.append(Order(product, sell_p, -min(pos + self.LIMIT, clip)))
 
         return orders
