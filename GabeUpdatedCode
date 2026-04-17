@@ -67,7 +67,7 @@ class Trader:
         PEPPER = "INTARIAN_PEPPER_ROOT"
         OSMIUM = "ASH_COATED_OSMIUM"
         
-        # Persistence
+        # Initialize history if empty
         td = {"pepper_mids": [], "OSMIUM_HISTORY": []}
         if state.traderData:
             try: td = json.loads(state.traderData)
@@ -82,29 +82,29 @@ class Trader:
             best_bid = max(depth.buy_orders.keys())
             best_ask = min(depth.sell_orders.keys())
             
-            # --- OSMIUM LOGIC: From 213510.py ---
+            # 1. VWMP Calculation (Improved Noise Filtering)
+            ask_vol = abs(depth.sell_orders[best_ask])
+            bid_vol = depth.buy_orders[best_bid]
+            vw_mid = ((best_bid * ask_vol) + (best_ask * bid_vol)) / (ask_vol + bid_vol)
+            
+            # --- OSMIUM LOGIC (Mean Reversion + Aggressive Skew) ---
             if product == OSMIUM:
-                # 1. VWMP Calculation
-                ask_vol = abs(depth.sell_orders[best_ask])
-                bid_vol = depth.buy_orders[best_bid]
-                mid_price = ((best_bid * ask_vol) + (best_ask * bid_vol)) / (ask_vol + bid_vol)
-                
-                # 2. Dynamic SMA History
                 history = td.get("OSMIUM_HISTORY", [])
-                history.append(mid_price)
+                history.append(vw_mid)
                 if len(history) > 30: history.pop(0)
                 td["OSMIUM_HISTORY"] = history
                 
                 if len(history) >= 10:
                     sma = sum(history) / len(history)
-                    if abs(sma - 10000) > 15: sma = 10000 # Sanity check
+                    if abs(sma - 10000) > 15: sma = 10000 # Anchor
                     
-                    # 3. Asymmetric Scaling and Thresholds
-                    risk_offset = (pos / LIMIT) * 2.0
-                    buy_thr = sma - 4.0 - risk_offset
-                    sell_thr = sma + 4.0 - risk_offset
+                    # 2. Exponential Inventory Skew (Robust Risk Mgmt)
+                    # We move the thresholds faster as we approach the limit
+                    risk_offset = (pos / LIMIT) * 4.0 
+                    buy_thr = sma - 4.5 - risk_offset
+                    sell_thr = sma + 4.5 - risk_offset
 
-                    # 4. Aggressive Market Taking
+                    # Market Taking
                     for price, vol in sorted(depth.sell_orders.items()):
                         if price <= buy_thr and pos < LIMIT:
                             buy_qty = min(abs(vol), LIMIT - pos)
@@ -117,24 +117,23 @@ class Trader:
                             orders.append(Order(product, int(price), int(-sell_qty)))
                             pos -= sell_qty
 
-                    # 5. Dynamic Market Making (Pennying)
+                    # Market Making (Pennying skewed by inventory)
                     if pos < LIMIT:
-                        mm_buy = min(best_bid + 1, int(sma - 1))
+                        mm_buy = min(best_bid + 1, int(sma - 2 - risk_offset))
                         orders.append(Order(product, mm_buy, LIMIT - pos))
                     if pos > -LIMIT:
-                        mm_sell = max(best_ask - 1, int(sma + 1))
+                        mm_sell = max(best_ask - 1, int(sma + 2 - risk_offset))
                         orders.append(Order(product, mm_sell, -LIMIT - pos))
 
-            # --- PEPPER LOGIC: Trend-Aware Regression from R1.6.py ---
+            # --- PEPPER LOGIC (Linear Regression Trend + VWMP) ---
             elif product == PEPPER:
-                mid = (best_bid + best_ask) / 2
                 hist = td.get("pepper_mids", [])
-                hist.append(mid)
-                if len(hist) > 50: hist.pop(0)
+                hist.append(vw_mid)
+                if len(hist) > 40: hist.pop(0)
                 td["pepper_mids"] = hist
 
                 if len(hist) >= 20:
-                    # Linear Regression
+                    # 3. Linear Regression (Robust Prediction)
                     n = len(hist)
                     x = list(range(n))
                     y = hist
@@ -145,29 +144,31 @@ class Trader:
                     slope = (n * sum_xy - sum_x * sum_y) / denom if denom != 0 else 0
                     predicted_fair = (sum_y - slope * sum_x) / n + slope * (n + 1)
                     
+                    # Trend Direction
                     direction = 1 if slope > 0.05 else (-1 if slope < -0.05 else 0)
 
-                    # 1. Market Taking
+                    # Market Taking skewed by trend
                     if direction == 1:
                         for price, vol in sorted(depth.sell_orders.items()):
-                            if price <= predicted_fair + 1 and pos < LIMIT:
+                            if price <= predicted_fair + 0.5 and pos < LIMIT:
                                 qty = min(abs(vol), LIMIT - pos)
                                 orders.append(Order(product, price, qty))
                                 pos += qty
                     elif direction == -1:
                         for price, vol in sorted(depth.buy_orders.items(), reverse=True):
-                            if price >= predicted_fair - 1 and pos > -LIMIT:
+                            if price >= predicted_fair - 0.5 and pos > -LIMIT:
                                 qty = min(abs(vol), pos + LIMIT)
                                 orders.append(Order(product, price, -qty))
                                 pos -= qty
 
-                    # 2. Strategic Passive Orders
+                    # Strategic Passive Orders (Laddered-style clips)
+                    clip_size = 20 # Protect against whipsaws
                     if pos < LIMIT:
-                        buy_p = int(min(best_bid + 1, predicted_fair - 1))
-                        orders.append(Order(product, buy_p, min(LIMIT - pos, 20)))
+                        buy_p = int(min(best_bid + 1, predicted_fair - 1.5))
+                        orders.append(Order(product, buy_p, min(LIMIT - pos, clip_size)))
                     if pos > -LIMIT:
-                        sell_p = int(max(best_ask - 1, predicted_fair + 1))
-                        orders.append(Order(product, sell_p, -min(pos + LIMIT, 20)))
+                        sell_p = int(max(best_ask - 1, predicted_fair + 1.5))
+                        orders.append(Order(product, sell_p, -min(pos + LIMIT, clip_size)))
 
             result[product] = orders
 
