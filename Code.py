@@ -1,6 +1,20 @@
+# =============================================================================
+# ROUND 3 - "Gloves Off" - Solvenar
+# -----------------------------------------------------------------------------
+# MANUAL CHALLENGE - Ornamental Bio-Pods (submit in GUI):
+#   Bid 1: 790
+#   Bid 2: 870
+# Reasoning: reserves uniform on {670,675,...,920} (51 levels), resell at 920.
+#   b1: argmax (b-665)*(920-b)/255 -> b = 792.5 -> use 790 (E ~ 63.7 / counterparty)
+#   b2: residual range {795..920}; ~857 ignoring penalty, use 870 to stay
+#        comfortably above an assumed avg_b2 ~ 855-870 and dampen the cubic penalty.
+# =============================================================================
+
 import json
-from typing import Any, List, Dict
+import math
+from typing import Any, List, Dict, Optional, Tuple
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
+
 
 class Logger:
     def __init__(self) -> None:
@@ -57,121 +71,416 @@ class Logger:
         if len(json.dumps(value)) <= max_length: return value
         return value[:max_length-3] + "..."
 
+
 logger = Logger()
 
-LIMIT = 80
-PEPPER = "INTARIAN_PEPPER_ROOT"
-OSMIUM = "ASH_COATED_OSMIUM"
-OSMIUM_FAIR = 10000
 
+# ---------------- Product constants ----------------
+HYDROGEL = "HYDROGEL_PACK"
+VELVET = "VELVETFRUIT_EXTRACT"
+
+# Vouchers used by the smile model (skip 4000: ~intrinsic, 6000/6500: pinned at 0.5)
+SMILE_STRIKES: List[int] = [4500, 5000, 5100, 5200, 5300, 5400, 5500]
+# Strikes we actually trade. VEV_5200 and VEV_5400 are excluded because the prior
+# backtest showed they generated almost all of the loss (-1103 and -224 respectively)
+# from noise-driven whipsaws. They still feed the smile fit as data points.
+TRADE_STRIKES: List[int] = [4500, 5000, 5100, 5300, 5500]
+VOUCHER_SYMS: Dict[int, str] = {k: f"VEV_{k}" for k in SMILE_STRIKES}
+ALL_VOUCHER_SYMS: List[str] = [f"VEV_{k}" for k in [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]]
+
+# Position limits
+LIMITS: Dict[str, int] = {HYDROGEL: 200, VELVET: 200}
+for s in ALL_VOUCHER_SYMS:
+    LIMITS[s] = 300
+
+VOUCHER_SOFT_LIMIT = 50  # tightened from 200 to limit damage from any one voucher
+HYDROGEL_FAIR = 10000
+
+# Time-to-expiry: Round 3 starts at TTE = 5 days; one round = 1_000_000 timestamp units
+TTE_START_DAYS = 5.0
+ROUND_LEN = 1_000_000
+
+
+# ---------------- Black-Scholes helpers ----------------
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_call_price(S: float, K: float, T: float, sigma: float) -> float:
+    if T <= 0 or sigma <= 0:
+        return max(S - K, 0.0)
+    sqrtT = math.sqrt(T)
+    d1 = (math.log(S / K) + 0.5 * sigma * sigma * T) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
+    return S * _norm_cdf(d1) - K * _norm_cdf(d2)
+
+
+def bs_call_delta(S: float, K: float, T: float, sigma: float) -> float:
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 1.0 if S > K else 0.0
+    d1 = (math.log(S / K) + 0.5 * sigma * sigma * T) / (sigma * math.sqrt(T))
+    return _norm_cdf(d1)
+
+
+def implied_vol(price: float, S: float, K: float, T: float) -> Optional[float]:
+    intrinsic = max(S - K, 0.0)
+    if price <= intrinsic + 1e-6 or T <= 0:
+        return None
+    lo, hi = 1e-4, 3.0
+    if bs_call_price(S, K, T, hi) < price:
+        return None
+    for _ in range(50):
+        mid = 0.5 * (lo + hi)
+        if bs_call_price(S, K, T, mid) > price:
+            hi = mid
+        else:
+            lo = mid
+    return 0.5 * (lo + hi)
+
+
+def fit_quadratic_smile(points: List[Tuple[float, float]]) -> Optional[Tuple[float, float, float]]:
+    """Closed-form least squares for iv = a + b*m + c*m^2."""
+    if len(points) < 4:
+        return None
+    n = len(points)
+    sx = sx2 = sx3 = sx4 = sy = sxy = sx2y = 0.0
+    for m, iv in points:
+        sx += m
+        sx2 += m * m
+        sx3 += m ** 3
+        sx4 += m ** 4
+        sy += iv
+        sxy += m * iv
+        sx2y += m * m * iv
+    # Normal equations matrix:
+    # | n   sx   sx2 | |a|   | sy   |
+    # | sx  sx2  sx3 | |b| = | sxy  |
+    # | sx2 sx3  sx4 | |c|   | sx2y |
+    M = [[n, sx, sx2], [sx, sx2, sx3], [sx2, sx3, sx4]]
+    Y = [sy, sxy, sx2y]
+    try:
+        # Cramer's rule via 3x3 determinants
+        def det3(m):
+            return (m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])
+                    - m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0])
+                    + m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]))
+        D = det3(M)
+        if abs(D) < 1e-12:
+            return None
+        Ma = [[Y[i] if j == 0 else M[i][j] for j in range(3)] for i in range(3)]
+        Mb = [[Y[i] if j == 1 else M[i][j] for j in range(3)] for i in range(3)]
+        Mc = [[Y[i] if j == 2 else M[i][j] for j in range(3)] for i in range(3)]
+        return (det3(Ma) / D, det3(Mb) / D, det3(Mc) / D)
+    except Exception:
+        return None
+
+
+def vw_mid(depth: OrderDepth) -> Optional[float]:
+    if not depth.buy_orders or not depth.sell_orders:
+        return None
+    best_bid = max(depth.buy_orders.keys())
+    best_ask = min(depth.sell_orders.keys())
+    bvol = depth.buy_orders[best_bid]
+    avol = abs(depth.sell_orders[best_ask])
+    if bvol + avol == 0:
+        return (best_bid + best_ask) / 2.0
+    # Volume-weighted: heavier side pulls mid toward the other side
+    return (best_bid * avol + best_ask * bvol) / (avol + bvol)
+
+
+# ---------------- Trader ----------------
 class Trader:
     def run(self, state: TradingState) -> tuple[dict[Symbol, list[Order]], int, str]:
-        result = {}
+        result: Dict[str, List[Order]] = {}
         conversions = 0
 
-        td = {"pepper_mids": []}
+        td: Dict[str, Any] = {"hydro_mids": [], "velvet_mids": []}
         if state.traderData:
-            try: td = json.loads(state.traderData)
-            except: pass
+            try:
+                td = json.loads(state.traderData)
+            except Exception:
+                pass
+        td.setdefault("hydro_mids", [])
+        td.setdefault("velvet_mids", [])
 
-        # ===== OSMIUM: stable fair-value market making around 10000 =====
-        depth = state.order_depths.get(OSMIUM)
-        if depth and depth.buy_orders and depth.sell_orders:
-            orders: List[Order] = []
-            pos = state.position.get(OSMIUM, 0)
-            best_bid = max(depth.buy_orders)
-            best_ask = min(depth.sell_orders)
+        # ===== HYDROGEL_PACK =====
+        self._trade_hydrogel(state, td, result)
 
-            # Take any sell <= FAIR-1 (free edge) and any buy >= FAIR+1
-            for price, vol in sorted(depth.sell_orders.items()):
-                if price <= OSMIUM_FAIR - 1 and pos < LIMIT:
-                    qty = min(-vol, LIMIT - pos)
-                    orders.append(Order(OSMIUM, price, qty))
-                    pos += qty
-            for price, vol in sorted(depth.buy_orders.items(), reverse=True):
-                if price >= OSMIUM_FAIR + 1 and pos > -LIMIT:
-                    qty = min(vol, pos + LIMIT)
-                    orders.append(Order(OSMIUM, price, -qty))
-                    pos -= qty
+        # ===== VELVETFRUIT_EXTRACT (also computes spot for vouchers) =====
+        velvet_spot = self._trade_velvet(state, td, result)
 
-            # Inventory skew on the MM quotes
-            skew = -1 if pos > LIMIT * 0.5 else (1 if pos < -LIMIT * 0.5 else 0)
-            mm_buy = max(best_bid + 1, OSMIUM_FAIR - 1) + skew
-            mm_sell = min(best_ask - 1, OSMIUM_FAIR + 1) + skew
-            if mm_buy < mm_sell:
-                if pos < LIMIT:
-                    orders.append(Order(OSMIUM, mm_buy, LIMIT - pos))
-                if pos > -LIMIT:
-                    orders.append(Order(OSMIUM, mm_sell, -LIMIT - pos))
+        # ===== VEV vouchers + delta hedge =====
+        if velvet_spot is not None:
+            self._trade_vouchers(state, td, result, velvet_spot)
 
-            result[OSMIUM] = orders
-
-        # PEPPER trends smoothly (+0.1/call on round-1 data) with a wide spread (~13).
-        # Crossing the spread is too costly, so accumulate via passive bids when trend
-        # is up and flip sides when slope reverses.
-        depth = state.order_depths.get(PEPPER)
-        if depth and depth.buy_orders and depth.sell_orders:
-            orders = []
-            pos = state.position.get(PEPPER, 0)
-            best_bid = max(depth.buy_orders)
-            best_ask = min(depth.sell_orders)
-            mid = (best_bid + best_ask) / 2
-
-            hist = td.get("pepper_mids", [])
-            hist.append(mid)
-            if len(hist) > 100: hist.pop(0)
-            td["pepper_mids"] = hist
-
-            slope = 0.0
-            if len(hist) >= 30:
-                slope = (hist[-1] - hist[0]) / (len(hist) - 1)
-
-            if slope > 0.02:
-                direction = 1
-            elif slope < -0.02:
-                direction = -1
-            else:
-                direction = 0
-
-            if direction == 0:
-                buy_price = best_bid + 1
-                sell_price = best_ask - 1
-                if buy_price < sell_price:
-                    if pos < LIMIT:
-                        orders.append(Order(PEPPER, buy_price, min(LIMIT - pos, 20)))
-                    if pos > -LIMIT:
-                        orders.append(Order(PEPPER, sell_price, -min(LIMIT + pos, 20)))
-            elif direction == 1:
-                if pos < 0:
-                    for price, vol in sorted(depth.sell_orders.items()):
-                        if pos >= 0: break
-                        qty = min(-vol, -pos)
-                        if qty > 0:
-                            orders.append(Order(PEPPER, price, qty))
-                            pos += qty
-                if pos < LIMIT:
-                    buy_price = min(best_bid + 1, best_ask - 1)
-                    orders.append(Order(PEPPER, buy_price, LIMIT - pos))
-                if pos >= LIMIT - 5:
-                    sell_price = max(best_ask - 1, int(round(mid)) + 4)
-                    orders.append(Order(PEPPER, sell_price, -min(15, LIMIT + pos)))
-            else:
-                if pos > 0:
-                    for price, vol in sorted(depth.buy_orders.items(), reverse=True):
-                        if pos <= 0: break
-                        qty = min(vol, pos)
-                        if qty > 0:
-                            orders.append(Order(PEPPER, price, -qty))
-                            pos -= qty
-                if pos > -LIMIT:
-                    sell_price = max(best_ask - 1, best_bid + 1)
-                    orders.append(Order(PEPPER, sell_price, -LIMIT - pos))
-                if pos <= -(LIMIT - 5):
-                    buy_price = min(best_bid + 1, int(round(mid)) - 4)
-                    orders.append(Order(PEPPER, buy_price, min(15, LIMIT - pos)))
-
-            result[PEPPER] = orders
-
-        td_out = json.dumps(td)
+        td_out = json.dumps(td, separators=(",", ":"))
         logger.flush(state, result, conversions, td_out)
         return result, conversions, td_out
+
+    # ---------- HYDROGEL ----------
+    def _trade_hydrogel(self, state: TradingState, td: Dict[str, Any], result: Dict[str, List[Order]]) -> None:
+        depth = state.order_depths.get(HYDROGEL)
+        if not depth or not depth.buy_orders or not depth.sell_orders:
+            return
+        m = vw_mid(depth)
+        if m is None:
+            return
+        hist = td["hydro_mids"]
+        hist.append(m)
+        if len(hist) > 100:
+            hist.pop(0)
+
+        sma = sum(hist) / len(hist)
+        # Anchor to 10000, but allow drift up to 20
+        if sma > HYDROGEL_FAIR + 20:
+            sma = HYDROGEL_FAIR + 20
+        elif sma < HYDROGEL_FAIR - 20:
+            sma = HYDROGEL_FAIR - 20
+        fair = 0.5 * sma + 0.5 * HYDROGEL_FAIR
+
+        pos = state.position.get(HYDROGEL, 0)
+        limit = LIMITS[HYDROGEL]
+        orders: List[Order] = []
+        best_bid = max(depth.buy_orders.keys())
+        best_ask = min(depth.sell_orders.keys())
+
+        # Take any obvious mispricing (>= 2 inside fair)
+        for price, vol in sorted(depth.sell_orders.items()):
+            if price <= fair - 2 and pos < limit:
+                qty = min(-vol, limit - pos)
+                if qty > 0:
+                    orders.append(Order(HYDROGEL, price, qty))
+                    pos += qty
+        for price, vol in sorted(depth.buy_orders.items(), reverse=True):
+            if price >= fair + 2 and pos > -limit:
+                qty = min(vol, pos + limit)
+                if qty > 0:
+                    orders.append(Order(HYDROGEL, price, -qty))
+                    pos -= qty
+
+        # Quote ±3 around fair, with inventory skew
+        skew = -round(pos / 40.0)
+        mm_buy = int(min(best_bid + 1, fair - 3 + skew))
+        mm_sell = int(max(best_ask - 1, fair + 3 + skew))
+        if mm_buy < mm_sell:
+            if pos < limit:
+                orders.append(Order(HYDROGEL, mm_buy, limit - pos))
+            if pos > -limit:
+                orders.append(Order(HYDROGEL, mm_sell, -limit - pos))
+
+        if orders:
+            result[HYDROGEL] = orders
+
+    # ---------- VELVET ----------
+    def _trade_velvet(self, state: TradingState, td: Dict[str, Any], result: Dict[str, List[Order]]) -> Optional[float]:
+        depth = state.order_depths.get(VELVET)
+        if not depth or not depth.buy_orders or not depth.sell_orders:
+            return None
+        m = vw_mid(depth)
+        if m is None:
+            return None
+        hist = td["velvet_mids"]
+        hist.append(m)
+        if len(hist) > 100:
+            hist.pop(0)
+
+        pos = state.position.get(VELVET, 0)
+        limit = LIMITS[VELVET]
+        orders: List[Order] = []
+        best_bid = max(depth.buy_orders.keys())
+        best_ask = min(depth.sell_orders.keys())
+        spread = best_ask - best_bid
+
+        # Take aggressive prints relative to vw_mid
+        for price, vol in sorted(depth.sell_orders.items()):
+            if price <= m - 2 and pos < limit:
+                qty = min(-vol, limit - pos)
+                if qty > 0:
+                    orders.append(Order(VELVET, price, qty))
+                    pos += qty
+        for price, vol in sorted(depth.buy_orders.items(), reverse=True):
+            if price >= m + 2 and pos > -limit:
+                qty = min(vol, pos + limit)
+                if qty > 0:
+                    orders.append(Order(VELVET, price, -qty))
+                    pos -= qty
+
+        # Passive quotes one inside the touch (skip if spread too tight)
+        if spread >= 2:
+            skew = -round(pos / 50.0)
+            mm_buy = best_bid + 1 + skew
+            mm_sell = best_ask - 1 + skew
+            if mm_buy < mm_sell:
+                clip = 40  # bumped from 30 since hedging is now passive/rare
+                if pos < limit:
+                    orders.append(Order(VELVET, int(mm_buy), min(limit - pos, clip)))
+                if pos > -limit:
+                    orders.append(Order(VELVET, int(mm_sell), -min(limit + pos, clip)))
+
+        if orders:
+            result[VELVET] = orders
+
+        return m
+
+    # ---------- VOUCHERS ----------
+    def _trade_vouchers(
+        self, state: TradingState, td: Dict[str, Any],
+        result: Dict[str, List[Order]], spot: float
+    ) -> None:
+        # Time to expiry in "days" units (vol absorbs the unit scaling)
+        T = TTE_START_DAYS - state.timestamp / ROUND_LEN
+        if T <= 1e-4:
+            return  # nothing useful left
+
+        # 1) per-strike implied vol from the current mid (use SMILE_STRIKES so the
+        # excluded TRADE_STRIKES still contribute data points to the fit)
+        iv_points: List[Tuple[float, float, int, float]] = []  # (m, iv, K, mid)
+        voucher_state: Dict[int, Dict[str, float]] = {}
+        for K in SMILE_STRIKES:
+            sym = VOUCHER_SYMS[K]
+            depth = state.order_depths.get(sym)
+            if not depth or not depth.buy_orders or not depth.sell_orders:
+                continue
+            best_bid = max(depth.buy_orders.keys())
+            best_ask = min(depth.sell_orders.keys())
+            mid = (best_bid + best_ask) / 2.0
+            iv = implied_vol(mid, spot, K, T)
+            voucher_state[K] = {
+                "best_bid": best_bid, "best_ask": best_ask, "mid": mid,
+                "spread": best_ask - best_bid,
+            }
+            if iv is None:
+                continue
+            m = math.log(K / spot)
+            iv_points.append((m, iv, K, mid))
+
+        # 2) fit smile, then EMA-smooth with stored coefs to dampen tick-noise
+        raw = fit_quadratic_smile([(m, iv) for (m, iv, _, _) in iv_points])
+        prev = td.get("smile_coefs")
+        if raw is not None:
+            if prev is not None and len(prev) == 3:
+                alpha = 0.2
+                coefs = (
+                    alpha * raw[0] + (1 - alpha) * prev[0],
+                    alpha * raw[1] + (1 - alpha) * prev[1],
+                    alpha * raw[2] + (1 - alpha) * prev[2],
+                )
+            else:
+                coefs = raw
+            td["smile_coefs"] = list(coefs)
+        elif prev is not None and len(prev) == 3:
+            coefs = (prev[0], prev[1], prev[2])  # reuse last good fit
+        else:
+            coefs = None
+
+        # Track total option delta from desired post-trade positions
+        net_option_delta = 0.0
+
+        # 3) generate per-voucher orders ONLY for TRADE_STRIKES
+        for K in TRADE_STRIKES:
+            sym = VOUCHER_SYMS[K]
+            if K not in voucher_state:
+                continue
+            vs = voucher_state[K]
+            depth = state.order_depths[sym]
+            pos = state.position.get(sym, 0)
+            soft_limit = VOUCHER_SOFT_LIMIT
+            mid = vs["mid"]
+            spread = vs["spread"]
+            best_bid = vs["best_bid"]
+            best_ask = vs["best_ask"]
+            m_lm = math.log(K / spot)
+
+            if coefs is not None:
+                a, b, c = coefs
+                fit_iv = a + b * m_lm + c * m_lm * m_lm
+                if fit_iv <= 0:
+                    fit_iv = 1e-3
+                theo = bs_call_price(spot, K, T, fit_iv)
+                delta_K = bs_call_delta(spot, K, T, fit_iv)
+                # Vega-aware threshold floor: require ~1% IV mispricing to act
+                vega_step = (
+                    bs_call_price(spot, K, T, fit_iv + 0.005)
+                    - bs_call_price(spot, K, T, fit_iv - 0.005)
+                )
+                iv_noise_thresh = abs(vega_step)
+            else:
+                theo = mid
+                delta_K = 1.0 if spot > K else 0.0
+                iv_noise_thresh = 0.0
+
+            half_spread = 0.5 * spread
+            threshold = max(half_spread + 1.5, iv_noise_thresh, 2.0)
+            clip = 15  # tighter per-tick size
+
+            orders: List[Order] = []
+
+            # Strong-edge entry: BUY when offered well below theo
+            if mid < theo - threshold and pos < soft_limit:
+                for price, vol in sorted(depth.sell_orders.items()):
+                    if price > theo - threshold:
+                        break
+                    if pos >= soft_limit:
+                        break
+                    qty = min(-vol, soft_limit - pos, clip)
+                    if qty > 0:
+                        orders.append(Order(sym, price, qty))
+                        pos += qty
+
+            # Strong-edge entry: SELL when bid well above theo
+            elif mid > theo + threshold and pos > -soft_limit:
+                for price, vol in sorted(depth.buy_orders.items(), reverse=True):
+                    if price < theo + threshold:
+                        break
+                    if pos <= -soft_limit:
+                        break
+                    qty = min(vol, pos + soft_limit, clip)
+                    if qty > 0:
+                        orders.append(Order(sym, price, -qty))
+                        pos -= qty
+
+            else:
+                # Mean-revert toward zero when no clear edge
+                if abs(mid - theo) < 0.4 * threshold and pos != 0:
+                    if pos > 0:
+                        scale = min(pos, 10)
+                        orders.append(Order(sym, int(best_ask - 1), -scale))
+                    else:
+                        scale = min(-pos, 10)
+                        orders.append(Order(sym, int(best_bid + 1), scale))
+
+            if orders:
+                result[sym] = orders
+
+            net_option_delta += pos * delta_K
+
+        # 4) PASSIVE delta hedge with VELVETFRUIT_EXTRACT (only when significant)
+        velvet_pos = state.position.get(VELVET, 0)
+        pending_velvet = sum(o.quantity for o in result.get(VELVET, []))
+        projected_velvet = velvet_pos + pending_velvet
+        total_delta = projected_velvet + net_option_delta
+        velvet_limit = LIMITS[VELVET]
+
+        if abs(total_delta) >= 25:
+            depth_v = state.order_depths.get(VELVET)
+            if depth_v and depth_v.buy_orders and depth_v.sell_orders:
+                best_bid_v = max(depth_v.buy_orders.keys())
+                best_ask_v = min(depth_v.sell_orders.keys())
+                hedge_qty = -int(round(total_delta))
+                if hedge_qty > 0:
+                    capacity = velvet_limit - projected_velvet
+                    hedge_qty = min(hedge_qty, max(0, capacity), 30)
+                    if hedge_qty > 0:
+                        # Passive: bid one tick inside our side
+                        price = best_bid_v + 1
+                        if price >= best_ask_v:  # don't cross
+                            price = best_ask_v - 1
+                        result.setdefault(VELVET, []).append(Order(VELVET, price, hedge_qty))
+                else:
+                    capacity = velvet_limit + projected_velvet
+                    hedge_qty = -min(-hedge_qty, max(0, capacity), 30)
+                    if hedge_qty < 0:
+                        price = best_ask_v - 1
+                        if price <= best_bid_v:
+                            price = best_bid_v + 1
+                        result.setdefault(VELVET, []).append(Order(VELVET, price, hedge_qty))
