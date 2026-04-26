@@ -80,8 +80,12 @@ HYDROGEL = "HYDROGEL_PACK"
 VELVET = "VELVETFRUIT_EXTRACT"
 
 # Vouchers used by the smile model (skip 4000: ~intrinsic, 6000/6500: pinned at 0.5)
-VOUCHER_STRIKES: List[int] = [4500, 5000, 5100, 5200, 5300, 5400, 5500]
-VOUCHER_SYMS: Dict[int, str] = {k: f"VEV_{k}" for k in VOUCHER_STRIKES}
+SMILE_STRIKES: List[int] = [4500, 5000, 5100, 5200, 5300, 5400, 5500]
+# Strikes we actually trade. VEV_5200 and VEV_5400 are excluded because the prior
+# backtest showed they generated almost all of the loss (-1103 and -224 respectively)
+# from noise-driven whipsaws. They still feed the smile fit as data points.
+TRADE_STRIKES: List[int] = [4500, 5000, 5100, 5300, 5500]
+VOUCHER_SYMS: Dict[int, str] = {k: f"VEV_{k}" for k in SMILE_STRIKES}
 ALL_VOUCHER_SYMS: List[str] = [f"VEV_{k}" for k in [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]]
 
 # Position limits
@@ -89,7 +93,7 @@ LIMITS: Dict[str, int] = {HYDROGEL: 200, VELVET: 200}
 for s in ALL_VOUCHER_SYMS:
     LIMITS[s] = 300
 
-VOUCHER_SOFT_LIMIT = 200  # stay well inside 300 hard limit so we never get rejected
+VOUCHER_SOFT_LIMIT = 50  # tightened from 200 to limit damage from any one voucher
 HYDROGEL_FAIR = 10000
 
 # Time-to-expiry: Round 3 starts at TTE = 5 days; one round = 1_000_000 timestamp units
@@ -307,7 +311,7 @@ class Trader:
             mm_buy = best_bid + 1 + skew
             mm_sell = best_ask - 1 + skew
             if mm_buy < mm_sell:
-                clip = 30
+                clip = 40  # bumped from 30 since hedging is now passive/rare
                 if pos < limit:
                     orders.append(Order(VELVET, int(mm_buy), min(limit - pos, clip)))
                 if pos > -limit:
@@ -328,10 +332,11 @@ class Trader:
         if T <= 1e-4:
             return  # nothing useful left
 
-        # 1) per-strike implied vol from the current mid
+        # 1) per-strike implied vol from the current mid (use SMILE_STRIKES so the
+        # excluded TRADE_STRIKES still contribute data points to the fit)
         iv_points: List[Tuple[float, float, int, float]] = []  # (m, iv, K, mid)
         voucher_state: Dict[int, Dict[str, float]] = {}
-        for K in VOUCHER_STRIKES:
+        for K in SMILE_STRIKES:
             sym = VOUCHER_SYMS[K]
             depth = state.order_depths.get(sym)
             if not depth or not depth.buy_orders or not depth.sell_orders:
@@ -349,14 +354,30 @@ class Trader:
             m = math.log(K / spot)
             iv_points.append((m, iv, K, mid))
 
-        # 2) fit smile
-        coefs = fit_quadratic_smile([(m, iv) for (m, iv, _, _) in iv_points])
+        # 2) fit smile, then EMA-smooth with stored coefs to dampen tick-noise
+        raw = fit_quadratic_smile([(m, iv) for (m, iv, _, _) in iv_points])
+        prev = td.get("smile_coefs")
+        if raw is not None:
+            if prev is not None and len(prev) == 3:
+                alpha = 0.2
+                coefs = (
+                    alpha * raw[0] + (1 - alpha) * prev[0],
+                    alpha * raw[1] + (1 - alpha) * prev[1],
+                    alpha * raw[2] + (1 - alpha) * prev[2],
+                )
+            else:
+                coefs = raw
+            td["smile_coefs"] = list(coefs)
+        elif prev is not None and len(prev) == 3:
+            coefs = (prev[0], prev[1], prev[2])  # reuse last good fit
+        else:
+            coefs = None
 
         # Track total option delta from desired post-trade positions
         net_option_delta = 0.0
 
-        # 3) generate per-voucher orders
-        for K in VOUCHER_STRIKES:
+        # 3) generate per-voucher orders ONLY for TRADE_STRIKES
+        for K in TRADE_STRIKES:
             sym = VOUCHER_SYMS[K]
             if K not in voucher_state:
                 continue
@@ -366,6 +387,8 @@ class Trader:
             soft_limit = VOUCHER_SOFT_LIMIT
             mid = vs["mid"]
             spread = vs["spread"]
+            best_bid = vs["best_bid"]
+            best_ask = vs["best_ask"]
             m_lm = math.log(K / spot)
 
             if coefs is not None:
@@ -375,70 +398,89 @@ class Trader:
                     fit_iv = 1e-3
                 theo = bs_call_price(spot, K, T, fit_iv)
                 delta_K = bs_call_delta(spot, K, T, fit_iv)
+                # Vega-aware threshold floor: require ~1% IV mispricing to act
+                vega_step = (
+                    bs_call_price(spot, K, T, fit_iv + 0.005)
+                    - bs_call_price(spot, K, T, fit_iv - 0.005)
+                )
+                iv_noise_thresh = abs(vega_step)
             else:
-                # No smile -> fall back to passive MM around mid only
                 theo = mid
-                # Rough delta from intrinsic when no model available
                 delta_K = 1.0 if spot > K else 0.0
+                iv_noise_thresh = 0.0
 
-            threshold = max(1.0, 0.75 * spread)  # require edge > most of half-spread
+            half_spread = 0.5 * spread
+            threshold = max(half_spread + 1.5, iv_noise_thresh, 2.0)
+            clip = 15  # tighter per-tick size
+
             orders: List[Order] = []
-            target_pos = pos
 
-            # Buy if market is offering below theoretical
+            # Strong-edge entry: BUY when offered well below theo
             if mid < theo - threshold and pos < soft_limit:
-                # Sweep asks up to (theo - threshold)
                 for price, vol in sorted(depth.sell_orders.items()):
                     if price > theo - threshold:
                         break
                     if pos >= soft_limit:
                         break
-                    qty = min(-vol, soft_limit - pos, 30)
+                    qty = min(-vol, soft_limit - pos, clip)
                     if qty > 0:
                         orders.append(Order(sym, price, qty))
                         pos += qty
-                target_pos = pos
 
-            # Sell if market is bidding above theoretical
+            # Strong-edge entry: SELL when bid well above theo
             elif mid > theo + threshold and pos > -soft_limit:
                 for price, vol in sorted(depth.buy_orders.items(), reverse=True):
                     if price < theo + threshold:
                         break
                     if pos <= -soft_limit:
                         break
-                    qty = min(vol, pos + soft_limit, 30)
+                    qty = min(vol, pos + soft_limit, clip)
                     if qty > 0:
                         orders.append(Order(sym, price, -qty))
                         pos -= qty
-                target_pos = pos
+
+            else:
+                # Mean-revert toward zero when no clear edge
+                if abs(mid - theo) < 0.4 * threshold and pos != 0:
+                    if pos > 0:
+                        scale = min(pos, 10)
+                        orders.append(Order(sym, int(best_ask - 1), -scale))
+                    else:
+                        scale = min(-pos, 10)
+                        orders.append(Order(sym, int(best_bid + 1), scale))
 
             if orders:
                 result[sym] = orders
 
-            net_option_delta += target_pos * delta_K
+            net_option_delta += pos * delta_K
 
-        # 4) delta hedge with VELVETFRUIT_EXTRACT
+        # 4) PASSIVE delta hedge with VELVETFRUIT_EXTRACT (only when significant)
         velvet_pos = state.position.get(VELVET, 0)
-        # Account for any net velvet orders we already placed
         pending_velvet = sum(o.quantity for o in result.get(VELVET, []))
         projected_velvet = velvet_pos + pending_velvet
         total_delta = projected_velvet + net_option_delta
         velvet_limit = LIMITS[VELVET]
 
-        if abs(total_delta) >= 5:
+        if abs(total_delta) >= 25:
             depth_v = state.order_depths.get(VELVET)
             if depth_v and depth_v.buy_orders and depth_v.sell_orders:
+                best_bid_v = max(depth_v.buy_orders.keys())
+                best_ask_v = min(depth_v.sell_orders.keys())
                 hedge_qty = -int(round(total_delta))
                 if hedge_qty > 0:
-                    # need to buy to offset short delta
                     capacity = velvet_limit - projected_velvet
-                    hedge_qty = min(hedge_qty, max(0, capacity), 50)
+                    hedge_qty = min(hedge_qty, max(0, capacity), 30)
                     if hedge_qty > 0:
-                        best_ask = min(depth_v.sell_orders.keys())
-                        result.setdefault(VELVET, []).append(Order(VELVET, best_ask, hedge_qty))
+                        # Passive: bid one tick inside our side
+                        price = best_bid_v + 1
+                        if price >= best_ask_v:  # don't cross
+                            price = best_ask_v - 1
+                        result.setdefault(VELVET, []).append(Order(VELVET, price, hedge_qty))
                 else:
                     capacity = velvet_limit + projected_velvet
-                    hedge_qty = -min(-hedge_qty, max(0, capacity), 50)
+                    hedge_qty = -min(-hedge_qty, max(0, capacity), 30)
                     if hedge_qty < 0:
-                        best_bid = max(depth_v.buy_orders.keys())
-                        result.setdefault(VELVET, []).append(Order(VELVET, best_bid, hedge_qty))
+                        price = best_ask_v - 1
+                        if price <= best_bid_v:
+                            price = best_bid_v + 1
+                        result.setdefault(VELVET, []).append(Order(VELVET, price, hedge_qty))
