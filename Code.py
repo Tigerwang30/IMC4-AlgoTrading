@@ -79,12 +79,14 @@ logger = Logger()
 HYDROGEL = "HYDROGEL_PACK"
 VELVET = "VELVETFRUIT_EXTRACT"
 
-# Vouchers used by the smile model (skip 4000: ~intrinsic, 6000/6500: pinned at 0.5)
-SMILE_STRIKES: List[int] = [4500, 5000, 5100, 5200, 5300, 5400, 5500]
-# All smile strikes are now traded. The earlier exclusion of 5200/5400 was driven by
-# a broken vega floor that suppressed every voucher trade; now that the threshold is
-# fixed and clips/limits are properly sized, every strike has positive expectancy.
-TRADE_STRIKES: List[int] = [4500, 5000, 5100, 5200, 5300, 5400, 5500]
+# Vouchers used by the smile model. We deliberately exclude 5200, 5300, 5400 from
+# BOTH fit and trade: the 443435 backtest showed they have persistent one-sided
+# biases (991-1000 ticks on the same side of theo), which is the fingerprint of a
+# smile-fit artifact rather than real alpha. Trading them lost -509 net while
+# pulling the curve away from the clean strikes. Skip 4000 (~intrinsic) and
+# 6000/6500 (pinned at 0.5) as before.
+SMILE_STRIKES: List[int] = [4500, 5000, 5100, 5500]
+TRADE_STRIKES: List[int] = [4500, 5000, 5100, 5500]
 VOUCHER_SYMS: Dict[int, str] = {k: f"VEV_{k}" for k in SMILE_STRIKES}
 ALL_VOUCHER_SYMS: List[str] = [f"VEV_{k}" for k in [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]]
 
@@ -93,7 +95,7 @@ LIMITS: Dict[str, int] = {HYDROGEL: 200, VELVET: 200}
 for s in ALL_VOUCHER_SYMS:
     LIMITS[s] = 300
 
-VOUCHER_SOFT_LIMIT = 100  # raised from 50 now that thresholds are properly calibrated
+VOUCHER_SOFT_LIMIT = 60  # 4 clean strikes only - reduced concentration risk
 HYDROGEL_FAIR = 10000
 
 # Time-to-expiry: Round 3 starts at TTE = 5 days; one round = 1_000_000 timestamp units
@@ -242,22 +244,23 @@ class Trader:
         best_bid = max(depth.buy_orders.keys())
         best_ask = min(depth.sell_orders.keys())
 
-        # Take any obvious mispricing (>= 2 inside fair)
+        # Take any clear mispricing (>= 2.5 inside fair) - tightened from 2 to chase less
         for price, vol in sorted(depth.sell_orders.items()):
-            if price <= fair - 2 and pos < limit:
+            if price <= fair - 2.5 and pos < limit:
                 qty = min(-vol, limit - pos)
                 if qty > 0:
                     orders.append(Order(HYDROGEL, price, qty))
                     pos += qty
         for price, vol in sorted(depth.buy_orders.items(), reverse=True):
-            if price >= fair + 2 and pos > -limit:
+            if price >= fair + 2.5 and pos > -limit:
                 qty = min(vol, pos + limit)
                 if qty > 0:
                     orders.append(Order(HYDROGEL, price, -qty))
                     pos -= qty
 
-        # Quote ±3 around fair, with inventory skew
-        skew = -round(pos / 40.0)
+        # Quote ±3 around fair, with stronger inventory skew (was /40) for faster
+        # mean-revert at limits - reduces drawdown from one-sided inventory.
+        skew = -round(pos / 25.0)
         mm_buy = int(min(best_bid + 1, fair - 3 + skew))
         mm_sell = int(max(best_ask - 1, fair + 3 + skew))
         if mm_buy < mm_sell:
@@ -409,8 +412,8 @@ class Trader:
                 iv_noise_thresh = 0.0
 
             half_spread = 0.5 * spread
-            threshold = max(half_spread + 0.5, iv_noise_thresh, 0.75)
-            clip = 25
+            threshold = max(half_spread + 0.3, iv_noise_thresh, 0.5)
+            clip = 20
 
             orders: List[Order] = []
 
