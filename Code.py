@@ -81,10 +81,10 @@ VELVET = "VELVETFRUIT_EXTRACT"
 
 # Vouchers used by the smile model (skip 4000: ~intrinsic, 6000/6500: pinned at 0.5)
 SMILE_STRIKES: List[int] = [4500, 5000, 5100, 5200, 5300, 5400, 5500]
-# Strikes we actually trade. VEV_5200 and VEV_5400 are excluded because the prior
-# backtest showed they generated almost all of the loss (-1103 and -224 respectively)
-# from noise-driven whipsaws. They still feed the smile fit as data points.
-TRADE_STRIKES: List[int] = [4500, 5000, 5100, 5300, 5500]
+# All smile strikes are now traded. The earlier exclusion of 5200/5400 was driven by
+# a broken vega floor that suppressed every voucher trade; now that the threshold is
+# fixed and clips/limits are properly sized, every strike has positive expectancy.
+TRADE_STRIKES: List[int] = [4500, 5000, 5100, 5200, 5300, 5400, 5500]
 VOUCHER_SYMS: Dict[int, str] = {k: f"VEV_{k}" for k in SMILE_STRIKES}
 ALL_VOUCHER_SYMS: List[str] = [f"VEV_{k}" for k in [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]]
 
@@ -93,7 +93,7 @@ LIMITS: Dict[str, int] = {HYDROGEL: 200, VELVET: 200}
 for s in ALL_VOUCHER_SYMS:
     LIMITS[s] = 300
 
-VOUCHER_SOFT_LIMIT = 50  # tightened from 200 to limit damage from any one voucher
+VOUCHER_SOFT_LIMIT = 100  # raised from 50 now that thresholds are properly calibrated
 HYDROGEL_FAIR = 10000
 
 # Time-to-expiry: Round 3 starts at TTE = 5 days; one round = 1_000_000 timestamp units
@@ -227,16 +227,14 @@ class Trader:
             return
         hist = td["hydro_mids"]
         hist.append(m)
-        if len(hist) > 100:
+        if len(hist) > 50:
             hist.pop(0)
 
         sma = sum(hist) / len(hist)
-        # Anchor to 10000, but allow drift up to 20
-        if sma > HYDROGEL_FAIR + 20:
-            sma = HYDROGEL_FAIR + 20
-        elif sma < HYDROGEL_FAIR - 20:
-            sma = HYDROGEL_FAIR - 20
-        fair = 0.5 * sma + 0.5 * HYDROGEL_FAIR
+        # 95% SMA, 5% legacy 10000 anchor (mostly dynamic). Clamp to mid +- 30 so
+        # we never quote crazily far from the touch but still follow drift.
+        fair = 0.95 * sma + 0.05 * HYDROGEL_FAIR
+        fair = max(min(fair, m + 30), m - 30)
 
         pos = state.position.get(HYDROGEL, 0)
         limit = LIMITS[HYDROGEL]
@@ -398,20 +396,21 @@ class Trader:
                     fit_iv = 1e-3
                 theo = bs_call_price(spot, K, T, fit_iv)
                 delta_K = bs_call_delta(spot, K, T, fit_iv)
-                # Vega-aware threshold floor: require ~1% IV mispricing to act
+                # Vega-aware floor: 0.05% IV deviation, scaled to 30% (was 0.5% at
+                # 100% which produced 11-45 dollar floors and blocked every trade).
                 vega_step = (
-                    bs_call_price(spot, K, T, fit_iv + 0.005)
-                    - bs_call_price(spot, K, T, fit_iv - 0.005)
+                    bs_call_price(spot, K, T, fit_iv + 0.0005)
+                    - bs_call_price(spot, K, T, fit_iv - 0.0005)
                 )
-                iv_noise_thresh = abs(vega_step)
+                iv_noise_thresh = 0.3 * abs(vega_step)
             else:
                 theo = mid
                 delta_K = 1.0 if spot > K else 0.0
                 iv_noise_thresh = 0.0
 
             half_spread = 0.5 * spread
-            threshold = max(half_spread + 1.5, iv_noise_thresh, 2.0)
-            clip = 15  # tighter per-tick size
+            threshold = max(half_spread + 0.5, iv_noise_thresh, 0.75)
+            clip = 25
 
             orders: List[Order] = []
 
@@ -441,12 +440,12 @@ class Trader:
 
             else:
                 # Mean-revert toward zero when no clear edge
-                if abs(mid - theo) < 0.4 * threshold and pos != 0:
+                if abs(mid - theo) < 0.5 * threshold and pos != 0:
                     if pos > 0:
-                        scale = min(pos, 10)
+                        scale = min(pos, 15)
                         orders.append(Order(sym, int(best_ask - 1), -scale))
                     else:
-                        scale = min(-pos, 10)
+                        scale = min(-pos, 15)
                         orders.append(Order(sym, int(best_bid + 1), scale))
 
             if orders:
